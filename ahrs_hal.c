@@ -8,6 +8,10 @@
  */
 
 #include "ahrs_hal.h"
+#include "icm42688_hal.h"
+
+//显示格式
+// #define EulerAngle
 
 // 为不同轴设置不同的PI参数
 #define KP_ROLL     3.2f    /**< Roll轴比例增益 */
@@ -23,7 +27,11 @@
 #define ERROR_DEADBAND    0.0050f /**< 误差死区 */
 
 // 积分限幅，防止积分饱和
-#define INT_LIMIT         0.1f    /**< 积分项限幅 */
+#define INT_LIMIT 0.1f          /**< 基础积分限幅值 */
+#define INT_LIMIT_FACTOR 0.5f   /**< 动态限幅系数 */
+
+#define US_TO_S  1000000.0f    // 微秒到秒的转换系数
+#define HALF_PERIOD_SCALE 2.0f // 半周期系数
 
 // 四元数和积分误差
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -63,12 +71,15 @@ static float invSqrt(float x) {
  * @brief      限制误差积分项
  * @param      value  待限制的积分值
  * @param      limit  限制值
- * @return     限制后的积分值
+ * @param      gx      x轴角速度(弧度制)
+ * @param      gy      y轴角速度(弧度制)
+ * @param      gz      z轴角速度(弧度制)
  */
-static float limitIntegral(float value, float limit) {
-    if(value > limit) return limit;
-    if(value < -limit) return -limit;
-    return value;
+static float limitIntegral(float value, float limit, float gx, float gy, float gz)
+{
+    // 根据角速度大小动态调整限幅值
+    float dynamic_limit = limit + fabsf(gx + gy + gz) * INT_LIMIT_FACTOR;
+    return fminf(fmaxf(value, -dynamic_limit), dynamic_limit);
 }
 
 /**
@@ -143,13 +154,14 @@ void ahrs_update(float gx, float gy, float gz, float ax, float ay, float az, flo
         return;
     }
     
-    // 计算时间差
+    //currentTime是以微秒为单位的时间戳，我们需要将其转换为秒，halfT表示半个采样周期，所以再除以2：2000000.0f = 1000000(微秒到秒的转换) * 2(半个周期)
     if(currentTime < lastTime) {
-        halfT = ((float)(currentTime + (0xFFFFFFFF - lastTime)) / 2000000.0f);
+        // 处理定时器溢出情况
+        halfT = ((float)(currentTime + (0xFFFFFFFF - lastTime)) / (US_TO_S * HALF_PERIOD_SCALE));
     } else {
-        halfT = ((float)(currentTime - lastTime) / 2000000.0f);
+        // 正常情况
+        halfT = ((float)(currentTime - lastTime) / (US_TO_S * HALF_PERIOD_SCALE));
     }
-    lastTime = currentTime;
     
     // 加速度计归一化
     norm = invSqrt(ax*ax + ay*ay + az*az);       
@@ -191,17 +203,20 @@ void ahrs_update(float gx, float gy, float gz, float ax, float ay, float az, flo
     
     // PI控制器，分别处理三个轴
     if(ex != 0.0f) {
-        exInt = limitIntegral(exInt + ex * KI_ROLL * halfT, INT_LIMIT);
+        exInt = exInt + ex * KI_ROLL * halfT;
+        exInt = limitIntegral(exInt, INT_LIMIT, gx, gy, gz);
         gx = gx + KP_ROLL * ex + exInt;
     }
     
     if(ey != 0.0f) {
-        eyInt = limitIntegral(eyInt + ey * KI_PITCH * halfT, INT_LIMIT);
+        eyInt = eyInt + ey * KI_PITCH * halfT;
+        eyInt = limitIntegral(eyInt, INT_LIMIT, gx, gy, gz);
         gy = gy + KP_PITCH * ey + eyInt;
     }
     
     if(ez != 0.0f) {
-        ezInt = limitIntegral(ezInt + ez * KI_YAW * halfT, INT_LIMIT);
+        ezInt = ezInt + ez * KI_YAW * halfT;
+        ezInt = limitIntegral(ezInt, INT_LIMIT, gx, gy, gz);
         gz = gz + KP_YAW * ez + ezInt;
     }
     
@@ -217,6 +232,8 @@ void ahrs_update(float gx, float gy, float gz, float ax, float ay, float az, flo
     q1 = tempq1 * norm;
     q2 = tempq2 * norm;
     q3 = tempq3 * norm;
+
+    #ifdef EulerAngle
     
     // 计算欧拉角
     attitude.yaw   = -atan2(2 * q1 * q2 + 2 * q0 * q3, -2 * q2*q2 - 2 * q3 * q3 + 1) * 180/AHRS_PI;
@@ -225,6 +242,8 @@ void ahrs_update(float gx, float gy, float gz, float ax, float ay, float az, flo
     
     // 调整yaw角范围
     if(attitude.yaw < 0) attitude.yaw += 360.0f;
+    
+    #endif
 }
 
 /**
